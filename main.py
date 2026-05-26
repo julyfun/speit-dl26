@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,20 @@ def args_to_dict(args: argparse.Namespace) -> dict[str, Any]:
     return {k: v for k, v in vars(args).items() if k != "eval"}
 
 
+def class_weights_from_labels(labels: np.ndarray, num_classes: int = 2) -> torch.Tensor:
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    return torch.tensor(len(labels) / (num_classes * counts), dtype=torch.float32)
+
+
+def format_cls_metrics(labels: np.ndarray, preds: np.ndarray) -> str:
+    parts = [f"pred1={preds.mean():.3f}"]
+    for cls in (0, 1):
+        mask = labels == cls
+        if mask.any():
+            parts.append(f"rec{cls}={(preds[mask] == cls).mean():.3f}")
+    return " ".join(parts)
+
+
 def resolve_pretrained_paths(
     model_name: str,
     accelerator: Accelerator,
@@ -109,10 +124,10 @@ def run_epoch(
     accelerator: Accelerator,
     loss_fn: nn.Module,
     train: bool,
-) -> tuple[float, float]:
+) -> tuple[float, float, str]:
     model.train(train)
     total_loss = 0.0
-    num_batches = 0
+    total_samples = 0
     all_preds: list[int] = []
     all_labels: list[int] = []
 
@@ -121,9 +136,11 @@ def run_epoch(
     for batch in progress:
         labels = batch.pop("labels")
         batch.pop("challenge_id", None)
+        batch_size = labels.size(0)
 
+        step_ctx = accelerator.accumulate(model) if train else contextlib.nullcontext()
         with torch.set_grad_enabled(train):
-            with accelerator.accumulate(model):
+            with step_ctx:
                 with accelerator.autocast():
                     if "metadata" in batch:
                         logits = model(
@@ -147,22 +164,29 @@ def run_epoch(
                             scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.detach().float().item()
-        num_batches += 1
+        total_loss += loss.detach().float().item() * batch_size
+        total_samples += batch_size
         preds = logits.detach().argmax(dim=-1)
-        gathered_preds = accelerator.gather_for_metrics(preds)
-        gathered_labels = accelerator.gather_for_metrics(labels)
+        gathered_preds, gathered_labels = accelerator.gather_for_metrics((preds, labels))
         all_preds.extend(gathered_preds.cpu().tolist())
         all_labels.extend(gathered_labels.cpu().tolist())
 
         if accelerator.is_local_main_process:
             progress.set_postfix(loss=f"{loss.detach().float().item():.4f}")
 
-    avg_loss = total_loss / max(num_batches, 1)
-    loss_tensor = torch.tensor(avg_loss, device=accelerator.device, dtype=torch.float32)
-    avg_loss = accelerator.reduce(loss_tensor, reduction="mean").item()
-    accuracy = accuracy_score(all_labels, all_preds)
-    return avg_loss, accuracy
+    avg_loss = 0.0
+    if total_samples > 0:
+        loss_sum = torch.tensor(total_loss, device=accelerator.device, dtype=torch.float64)
+        sample_count = torch.tensor(float(total_samples), device=accelerator.device, dtype=torch.float64)
+        loss_sum = accelerator.reduce(loss_sum, reduction="sum")
+        sample_count = accelerator.reduce(sample_count, reduction="sum")
+        avg_loss = (loss_sum / sample_count).item()
+
+    label_arr = np.asarray(all_labels)
+    pred_arr = np.asarray(all_preds)
+    accuracy = accuracy_score(label_arr, pred_arr)
+    summary = "" if train else format_cls_metrics(label_arr, pred_arr)
+    return avg_loss, accuracy, summary
 
 
 @torch.no_grad()
@@ -196,9 +220,9 @@ def predict_test(
         probs = torch.softmax(logits, dim=-1)[:, 1]
         preds = logits.argmax(dim=-1)
 
-        gathered_ids = accelerator.gather_for_metrics(challenge_ids)
-        gathered_preds = accelerator.gather_for_metrics(preds)
-        gathered_probs = accelerator.gather_for_metrics(probs)
+        gathered_ids, gathered_preds, gathered_probs = accelerator.gather_for_metrics(
+            (challenge_ids, preds, probs)
+        )
 
         all_ids.extend(gathered_ids.cpu().tolist())
         all_preds.extend(gathered_preds.cpu().tolist())
@@ -332,7 +356,17 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
             torch.load(Path(args.load) / "optimizer.pt", map_location="cpu", weights_only=True)
         )
 
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    class_counts = np.bincount(train_labels, minlength=2)
+    class_weights = class_weights_from_labels(train_labels).to(accelerator.device)
+    loss_fn = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
+    if accelerator.is_main_process:
+        print(
+            f"Train class counts: 0={class_counts[0]}, 1={class_counts[1]}, "
+            f"weights={[round(w, 3) for w in class_weights.tolist()]}"
+        )
 
     model, optimizer, train_loader, val_loader = accelerator.prepare(
         model, optimizer, train_loader, val_loader
@@ -367,10 +401,10 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         if accelerator.is_main_process:
             print(f"\n=== Epoch {epoch + 1}/{args.target_train_iteration} ===")
 
-        train_loss, train_acc = run_epoch(
+        train_loss, train_acc, _ = run_epoch(
             model, train_loader, optimizer, scheduler, accelerator, loss_fn, True
         )
-        val_loss, val_acc = run_epoch(
+        val_loss, val_acc, val_diag = run_epoch(
             model, val_loader, optimizer, None, accelerator, loss_fn, False
         )
         global_step += updates_per_epoch
@@ -379,7 +413,7 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         if accelerator.is_main_process:
             print(
                 f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
-                f"val loss={val_loss:.4f} acc={val_acc:.4f}"
+                f"val loss={val_loss:.4f} acc={val_acc:.4f} | {val_diag}"
             )
 
         improved = val_acc > best_metric
