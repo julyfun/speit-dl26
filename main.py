@@ -100,6 +100,10 @@ def format_cls_metrics(labels: np.ndarray, preds: np.ndarray) -> str:
     return " ".join(parts)
 
 
+def get_current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
+
+
 def resolve_pretrained_paths(
     model_name: str,
     accelerator: Accelerator,
@@ -339,6 +343,9 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
     val_loader = create_dataloader(
         val_dataset, per_device_batch, shuffle=False, num_workers=args.num_workers
     )
+    global_updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_updates = global_updates_per_epoch * args.target_train_iteration
+    warmup_steps = int(total_updates * args.warmup_ratio) if total_updates > 0 else 0
 
     model = FusionClassifier(
         model_name=encoder_path,
@@ -368,15 +375,6 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
             f"weights={[round(w, 3) for w in class_weights.tolist()]}"
         )
 
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader
-    )
-
-    updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
-    remaining_epochs = max(args.target_train_iteration - completed_epochs, 0)
-    total_updates = updates_per_epoch * remaining_epochs
-    warmup_steps = int(total_updates * args.warmup_ratio) if total_updates > 0 else 0
-
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -386,7 +384,12 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         scheduler.load_state_dict(
             torch.load(Path(args.load) / "scheduler.pt", map_location="cpu", weights_only=True)
         )
-    scheduler = accelerator.prepare(scheduler)
+
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
 
     if accelerator.is_main_process:
         print(
@@ -413,7 +416,8 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         if accelerator.is_main_process:
             print(
                 f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
-                f"val loss={val_loss:.4f} acc={val_acc:.4f} | {val_diag}"
+                f"val loss={val_loss:.4f} acc={val_acc:.4f} | "
+                f"lr={get_current_lr(optimizer):.3e} | {val_diag}"
             )
 
         improved = val_acc > best_metric
