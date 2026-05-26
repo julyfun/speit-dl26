@@ -1,0 +1,7 @@
+.venv
+*.zip
+*.jsonl
+outputs/
+__pycache__/
+*.pyc
+Kaggle2025

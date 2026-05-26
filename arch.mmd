@@ -1,0 +1,28 @@
+flowchart TD
+    subgraph Text["Text Branch"]
+        direction TB
+        T0["Built text string<br/>(full_text · description · quoted · HASHTAGS · SOURCE)"]
+        T1["XLM-RoBERTa Tokenizer<br/>cardiffnlp/twitter-xlm-roberta-base<br/>SentencePiece · max_length=256"]
+        T2["input_ids  [B, 256]<br/>seq[0] = &lt;s&gt;  (sentence-start token)"]
+        T3["Embedding Layer<br/>TokenEmbed + PositionEmbed  →  768-d"]
+        T4["12 × Transformer Block<br/>(Self-Attention + FFN)"]
+        T5["last_hidden_state  [B, 256, 768]<br/>take index 0  →  h_text  [B, 768]"]
+        T0 --> T1 --> T2 --> T3 --> T4 --> T5
+    end
+
+    subgraph Meta["Metadata Branch"]
+        direction TB
+        M0["23-d numeric vector<br/>(counts · lengths · user stats · flags)"]
+        M1["Z-score normalize<br/>(train-fold mean / std)"]
+        M2["MLP  23 → 64 → 64<br/>GELU · Dropout"]
+        M3["h_meta  [B, 64]"]
+        M0 --> M1 --> M2 --> M3
+    end
+
+    F["Concat  [h_text ; h_meta]  →  [B, 832]"]
+    H["Dropout(0.15)  →  Linear(832 → 2)"]
+    Y["logits  →  argmax  →  0 Observer / 1 Influencer"]
+
+    T5 --> F
+    M3 --> F
+    F --> H --> Y
