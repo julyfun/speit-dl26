@@ -15,13 +15,17 @@ class FusionClassifier(nn.Module):
         use_metadata: bool = True,
         dropout: float = 0.15,
         meta_hidden: int = 64,
+        local_files_only: bool = False,
     ) -> None:
         super().__init__()
         self.use_metadata = use_metadata
-        config = AutoConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name, local_files_only=local_files_only)
         # 分类用 last_hidden_state[:, 0]，不用 pooler；保留 pooler 会在 DDP 下报 unused param
         self.encoder = AutoModel.from_pretrained(
-            model_name, config=config, add_pooling_layer=False
+            model_name,
+            config=config,
+            add_pooling_layer=False,
+            local_files_only=local_files_only,
         )
         hidden_size = config.hidden_size
 

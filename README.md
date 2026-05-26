@@ -1,6 +1,6 @@
 # SPEIT DL26 — Influencer vs Observer 分类
 
-基于 Hugging Face 的三路特征融合微调：`cardiffnlp/twitter-xlm-roberta-base` + 结构化 metadata MLP。
+基于 Hugging Face 的三路特征融合微调：`cardiffnlp/twitter-xlm-roberta-large-2022` + 结构化 metadata MLP。
 
 ## 环境
 
@@ -12,30 +12,38 @@ uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available
 
 **注意**：本机驱动为 CUDA 12.4，必须使用 `cu124` 版 PyTorch，不能用 `cu130`（会 silently 回退 CPU）。
 
-## 训练（双卡 4090，fold 0）
-
-默认 `batch_size=64` / 卡，`max_length=256`，bf16，约可吃满 48GB 显存。若 OOM：
+## 训练（双卡 4090，任意 fold）
 
 ```bash
-BATCH_SIZE=48 GRAD_ACCUM=2 bash scripts/train_fold0.sh
-# 或
-BATCH_SIZE=32 GRAD_ACCUM=2 bash scripts/train_fold0.sh
+bash scripts/train_fold.sh 0    # fold 0
+bash scripts/train_fold.sh 1    # fold 1
+# ... 到 fold 4
 ```
+
+默认 `batch_size=128` / 卡，checkpoint 目录 `outputs/twitter-xlm-r-large-fold{N}`。
+
+若 OOM：
+
+```bash
+BATCH_SIZE=64 GRAD_ACCUM=2 bash scripts/train_fold.sh 0
+```
+
+`train_fold0.sh` 仍可用，等价于 `train_fold.sh 0`。
 
 或直接：
 
 ```bash
 uv run accelerate launch --num_processes 2 main.py \
-  --model-name cardiffnlp/twitter-xlm-roberta-base \
+  --model-name cardiffnlp/twitter-xlm-roberta-large-2022 \
   --train-path Kaggle2025/train.jsonl \
   --test-path Kaggle2025/kaggle_test.jsonl \
-  --save outputs/twitter-xlm-r-base-fold0 \
+  --save outputs/twitter-xlm-r-large-fold0 \
   --target-train-iteration 5 \
   --fold 0 \
   --num-folds 5 \
   --seed 42 \
   --max-length 256 \
-  --batch-size 64 \
+  --batch-size 32 \
   --use-metadata
 ```
 
@@ -45,26 +53,28 @@ uv run accelerate launch --num_processes 2 main.py \
 
 ```bash
 uv run accelerate launch --num_processes 2 main.py \
-  --load outputs/twitter-xlm-r-base-fold0 \
-  --save outputs/twitter-xlm-r-base-fold0 \
+  --load outputs/twitter-xlm-r-large-fold0 \
+  --save outputs/twitter-xlm-r-large-fold0 \
   --target-train-iteration 5
 ```
 
 ## 生成提交
 
 ```bash
+bash scripts/eval_fold.sh 0
+bash scripts/eval_fold.sh 1
+# ...
+```
+
+或：
+
+```bash
 bash scripts/eval_fold0.sh
-# 或
-uv run accelerate launch main.py \
-  --load outputs/twitter-xlm-r-base-fold0 \
-  --eval \
-  --use-best \
-  --output-csv outputs/submission_fold0.csv
 ```
 
 输出：
 - `outputs/submission_fold0.csv` — Kaggle 格式 `ID,Prediction`
-- `outputs/twitter-xlm-r-base-fold0/best/test_probs.npy` — 概率，供后续 ensemble
+- `outputs/twitter-xlm-r-large-fold0/best/test_probs.npy` — 概率，供后续 ensemble
 
 ## 目录结构
 
@@ -77,7 +87,9 @@ src/
   utils.py           # checkpoint / seed
 outputs/             # checkpoint 与提交（gitignore）
 scripts/
-  train_fold0.sh
+  train_fold.sh      # bash scripts/train_fold.sh {0..4}
+  eval_fold.sh
+  train_fold0.sh     # -> train_fold.sh 0
   eval_fold0.sh
 ```
 

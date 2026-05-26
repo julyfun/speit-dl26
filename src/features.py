@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,7 @@ SOURCE_RE = re.compile(r">([^<]+)<")
 URL_RE = re.compile(r"https?://\S+|t\.co/\S+", re.IGNORECASE)
 MENTION_RE = re.compile(r"@\w+")
 HASHTAG_RE = re.compile(r"#\w+")
+TWITTER_TIME_FMT = "%a %b %d %H:%M:%S +0000 %Y"
 
 METADATA_NAMES = [
     "retweet_count",
@@ -47,6 +49,12 @@ METADATA_NAMES = [
     "user_has_url",
     "user_has_location",
     "user_has_banner",
+    "is_reply",
+    "retweeted",
+    "favorited",
+    "user_protected",
+    "user_default_profile_image",
+    "user_account_age_days",
 ]
 
 
@@ -101,6 +109,16 @@ def build_text(record: dict[str, Any]) -> str:
         if tags:
             parts.append(f"[HASHTAGS] {tags}")
 
+    mentions = entities.get("user_mentions") or []
+    if mentions:
+        handles = " ".join(f"@{m.get('screen_name', '')}" for m in mentions if m.get("screen_name"))
+        if handles:
+            parts.append(f"[MENTIONS] {handles}")
+
+    lang = record.get("lang")
+    if lang:
+        parts.append(f"[LANG] {lang}")
+
     source = _extract_source(record.get("source"))
     parts.append(f"[SOURCE] {source}")
 
@@ -124,6 +142,36 @@ def _count_media(record: dict[str, Any]) -> float:
 
 def _bool_to_float(value: Any) -> float:
     return 1.0 if bool(value) else 0.0
+
+
+def _parse_twitter_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, TWITTER_TIME_FMT)
+    except ValueError:
+        return None
+
+
+def _is_reply(record: dict[str, Any]) -> bool:
+    return any(
+        record.get(key) is not None
+        for key in (
+            "in_reply_to_status_id",
+            "in_reply_to_status_id_str",
+            "in_reply_to_user_id",
+            "in_reply_to_user_id_str",
+            "in_reply_to_screen_name",
+        )
+    )
+
+
+def _account_age_days(record: dict[str, Any], user: dict[str, Any]) -> float:
+    tweet_time = _parse_twitter_time(record.get("created_at"))
+    user_time = _parse_twitter_time(user.get("created_at"))
+    if tweet_time is None or user_time is None:
+        return 0.0
+    return max((tweet_time - user_time).total_seconds() / 86400.0, 0.0)
 
 
 def extract_metadata(record: dict[str, Any]) -> np.ndarray:
@@ -155,6 +203,12 @@ def extract_metadata(record: dict[str, Any]) -> np.ndarray:
         _bool_to_float(user.get("url")),
         _bool_to_float(user.get("location")),
         _bool_to_float(user.get("profile_banner_url")),
+        _bool_to_float(_is_reply(record)),
+        _bool_to_float(record.get("retweeted")),
+        _bool_to_float(record.get("favorited")),
+        _bool_to_float(user.get("protected")),
+        _bool_to_float(user.get("default_profile_image")),
+        _account_age_days(record, user),
     ]
     return np.asarray(values, dtype=np.float32)
 

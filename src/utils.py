@@ -13,6 +13,20 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 
+def ensure_hub_cached(model_name: str, accelerator) -> Path:
+    """Download full repo (incl. safetensors) on main process, then all ranks read local cache."""
+    from huggingface_hub import snapshot_download
+
+    if accelerator.is_main_process:
+        print(f"Downloading {model_name} (waiting for full weights)...")
+        snapshot_download(repo_id=model_name)
+    accelerator.wait_for_everyone()
+    cache_dir = Path(snapshot_download(repo_id=model_name, local_files_only=True))
+    if accelerator.is_main_process:
+        print(f"Model ready: {cache_dir}")
+    return cache_dir
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)

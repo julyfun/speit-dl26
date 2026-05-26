@@ -29,6 +29,7 @@ from src.data import (
 from src.features import METADATA_NAMES
 from src.model import FusionClassifier
 from src.utils import (
+    ensure_hub_cached,
     load_metadata_stats,
     load_model_weights,
     load_trainer_state,
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-name",
         type=str,
-        default="cardiffnlp/twitter-xlm-roberta-base",
+        default="cardiffnlp/twitter-xlm-roberta-large-2022",
     )
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--num-folds", type=int, default=5)
@@ -84,6 +85,22 @@ def args_to_dict(args: argparse.Namespace) -> dict[str, Any]:
     return {k: v for k, v in vars(args).items() if k != "eval"}
 
 
+def resolve_pretrained_paths(
+    model_name: str,
+    accelerator: Accelerator,
+    checkpoint_dir: Path | None,
+) -> tuple[str, str]:
+    """Return (tokenizer_path, encoder_path), always fully local after this call."""
+    if checkpoint_dir and (checkpoint_dir / "tokenizer").exists():
+        if (checkpoint_dir / "encoder").exists():
+            return str(checkpoint_dir / "tokenizer"), str(checkpoint_dir / "encoder")
+        cache_dir = ensure_hub_cached(model_name, accelerator)
+        return str(checkpoint_dir / "tokenizer"), str(cache_dir)
+
+    cache_dir = ensure_hub_cached(model_name, accelerator)
+    return str(cache_dir), str(cache_dir)
+
+
 def run_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -95,6 +112,7 @@ def run_epoch(
 ) -> tuple[float, float]:
     model.train(train)
     total_loss = 0.0
+    num_batches = 0
     all_preds: list[int] = []
     all_labels: list[int] = []
 
@@ -104,41 +122,45 @@ def run_epoch(
         labels = batch.pop("labels")
         batch.pop("challenge_id", None)
 
-        with accelerator.accumulate(model):
-            with accelerator.autocast():
-                if "metadata" in batch:
-                    logits = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        metadata=batch["metadata"],
-                    )
-                else:
-                    logits = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                    )
-                loss = loss_fn(logits, labels)
+        with torch.set_grad_enabled(train):
+            with accelerator.accumulate(model):
+                with accelerator.autocast():
+                    if "metadata" in batch:
+                        logits = model(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            metadata=batch["metadata"],
+                        )
+                    else:
+                        logits = model(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                        )
+                    loss = loss_fn(logits, labels)
 
-            if train:
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                if train:
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
-        preds = logits.argmax(dim=-1)
-        gathered_preds = accelerator.gather(preds)
-        gathered_labels = accelerator.gather(labels)
+        total_loss += loss.detach().float().item()
+        num_batches += 1
+        preds = logits.detach().argmax(dim=-1)
+        gathered_preds = accelerator.gather_for_metrics(preds)
+        gathered_labels = accelerator.gather_for_metrics(labels)
         all_preds.extend(gathered_preds.cpu().tolist())
         all_labels.extend(gathered_labels.cpu().tolist())
 
         if accelerator.is_local_main_process:
-            progress.set_postfix(loss=f"{loss.item():.4f}")
+            progress.set_postfix(loss=f"{loss.detach().float().item():.4f}")
 
-    avg_loss = total_loss / max(len(dataloader), 1)
+    avg_loss = total_loss / max(num_batches, 1)
+    loss_tensor = torch.tensor(avg_loss, device=accelerator.device, dtype=torch.float32)
+    avg_loss = accelerator.reduce(loss_tensor, reduction="mean").item()
     accuracy = accuracy_score(all_labels, all_preds)
     return avg_loss, accuracy
 
@@ -155,28 +177,28 @@ def predict_test(
     all_probs: list[float] = []
 
     for batch in tqdm(dataloader, disable=not accelerator.is_local_main_process):
-        challenge_ids = batch.pop("challenge_id").to(accelerator.device)
+        challenge_ids = batch.pop("challenge_id")
         batch.pop("labels", None)
-        batch = {k: v.to(accelerator.device) for k, v in batch.items()}
 
-        if "metadata" in batch:
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                metadata=batch["metadata"],
-            )
-        else:
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
+        with accelerator.autocast():
+            if "metadata" in batch:
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    metadata=batch["metadata"],
+                )
+            else:
+                logits = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                )
 
         probs = torch.softmax(logits, dim=-1)[:, 1]
         preds = logits.argmax(dim=-1)
 
-        gathered_ids = accelerator.gather(challenge_ids)
-        gathered_preds = accelerator.gather(preds)
-        gathered_probs = accelerator.gather(probs)
+        gathered_ids = accelerator.gather_for_metrics(challenge_ids)
+        gathered_preds = accelerator.gather_for_metrics(preds)
+        gathered_probs = accelerator.gather_for_metrics(probs)
 
         all_ids.extend(gathered_ids.cpu().tolist())
         all_preds.extend(gathered_preds.cpu().tolist())
@@ -264,9 +286,10 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
             )
         return
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        Path(args.load) / "tokenizer" if args.load and (Path(args.load) / "tokenizer").exists() else model_name
-    )
+    checkpoint_dir = Path(args.load) if args.load and Path(args.load).exists() else None
+    tokenizer_path, encoder_path = resolve_pretrained_paths(model_name, accelerator, checkpoint_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
 
     train_dataset = TweetDataset(
         train_subset,
@@ -294,10 +317,11 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
     )
 
     model = FusionClassifier(
-        model_name=model_name,
+        model_name=encoder_path,
         num_metadata=len(METADATA_NAMES),
         use_metadata=use_metadata,
         dropout=args.dropout,
+        local_files_only=True,
     )
     if args.load and (Path(args.load) / "model.pt").exists():
         load_model_weights(model, Path(args.load))
@@ -307,6 +331,12 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         optimizer.load_state_dict(
             torch.load(Path(args.load) / "optimizer.pt", map_location="cpu", weights_only=True)
         )
+
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
 
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     remaining_epochs = max(args.target_train_iteration - completed_epochs, 0)
@@ -322,17 +352,13 @@ def run_train(args: argparse.Namespace, accelerator: Accelerator) -> None:
         scheduler.load_state_dict(
             torch.load(Path(args.load) / "scheduler.pt", map_location="cpu", weights_only=True)
         )
-
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-
-    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, scheduler
-    )
+    scheduler = accelerator.prepare(scheduler)
 
     if accelerator.is_main_process:
         print(
             f"Train samples={len(train_subset)}, val samples={len(val_subset)}, "
             f"per_device_batch={per_device_batch}, gpus={accelerator.num_processes}, "
+            f"steps_per_epoch={len(train_loader)}, "
             f"epochs {completed_epochs}->{args.target_train_iteration}"
         )
 
@@ -435,6 +461,7 @@ def run_eval(args: argparse.Namespace, accelerator: Accelerator) -> None:
     max_length = state["args"].get("max_length", args.max_length)
     metadata_stats = load_metadata_stats(load_dir)
 
+    encoder_path = str(load_dir / "encoder") if (load_dir / "encoder").exists() else model_name
     tokenizer = AutoTokenizer.from_pretrained(load_dir / "tokenizer")
     test_records = load_jsonl(args.test_path)
 
@@ -451,10 +478,11 @@ def run_eval(args: argparse.Namespace, accelerator: Accelerator) -> None:
     )
 
     model = FusionClassifier(
-        model_name=model_name,
+        model_name=encoder_path,
         num_metadata=len(METADATA_NAMES),
         use_metadata=use_metadata,
         dropout=state["args"].get("dropout", args.dropout),
+        local_files_only=(load_dir / "encoder").exists(),
     )
     load_model_weights(model, load_dir)
     model, test_loader = accelerator.prepare(model, test_loader)
